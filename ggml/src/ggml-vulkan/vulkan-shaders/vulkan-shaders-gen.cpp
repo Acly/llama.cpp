@@ -1,49 +1,54 @@
-
-
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <array>
 #include <vector>
 #include <map>
-#include <thread>
-#include <mutex>
-#include <future>
-#include <queue>
-#include <condition_variable>
+#include <algorithm>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cassert>
-#include <algorithm>
-#include <sys/stat.h>
-#include <sys/types.h>
 
-#ifdef _WIN32
-    #include <windows.h>
-    #include <direct.h> // For _mkdir on Windows
-#else
-    #include <unistd.h>
-    #include <sys/wait.h>
-    #include <fcntl.h>
-#endif
+char const * usage = R"(Usage: vulkan-shaders-gen [options]
 
-#define ASYNCIO_CONCURRENCY 64
+Compiles Vulkan compute shaders to SPIR-V and embeds it into C++ source files
 
-std::mutex lock;
-std::vector<std::pair<std::string, std::string>> shader_fnames;
+Options:
+  --glslc <path>          Path to glslc executable (default: glslc)
+  --input-dir <path>      Input directory containing .comp shader files
+  --output-dir <path>     Output directory for compiled .spv files
+  --target-hpp <path>     Output C++ header file path
+  --target-cpp <path>     Output C++ source file path
+  --target-cmake <path>   Output CMakeLists.txt file path
+  --no-embed              Do not embed SPIR-V binaries into C++ source
+
+This executable runs at build time. Typically it is invoked by CMake like this:
+  1. Run with --target-cmake to generate CMakeLists.txt that contains build
+     commands for the shaders.
+  2. Configure and build the generated CMake sub-project to compile the shaders
+     into SPIR-V files.
+  3. Run without --target-cmake to generate C++ source files that embed the
+     SPIR-V binaries. This invocation is part of the generated sub-project.
+
+If --no-embed is used, step 1 will generate stub C++ source files, and
+step 3 is skipped. This allows fast iteration on shader code without
+recompiling C++ code, but can't be deployed.
+)";
+
+
+using std::filesystem::path;
+
+std::vector<std::pair<std::string, path>> shader_fnames;
 std::locale c_locale("C");
 
 std::string GLSLC = "glslc";
-std::string input_dir = "vulkan-shaders";
-std::string output_dir = "/tmp";
-std::string target_hpp = "ggml-vulkan-shaders.hpp";
-std::string target_cpp = "ggml-vulkan-shaders.cpp";
-std::string target_cmake = "";
-bool no_clean = false;
-bool no_embed = false;
+path input_dir = "vulkan-shaders";
+path output_dir = "/tmp";
 
 const std::vector<std::string> type_names = {
     "f32",
@@ -78,114 +83,6 @@ enum MatMulIdType {
 };
 
 namespace {
-void execute_command(const std::string& command, std::string& stdout_str, std::string& stderr_str) {
-#ifdef _WIN32
-    HANDLE stdout_read, stdout_write;
-    HANDLE stderr_read, stderr_write;
-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
-
-    if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0) ||
-        !SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0)) {
-        throw std::runtime_error("Failed to create stdout pipe");
-    }
-
-    if (!CreatePipe(&stderr_read, &stderr_write, &sa, 0) ||
-        !SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0)) {
-        throw std::runtime_error("Failed to create stderr pipe");
-    }
-
-    PROCESS_INFORMATION pi;
-    STARTUPINFOA si = {};
-    si.cb = sizeof(STARTUPINFOA);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = stdout_write;
-    si.hStdError = stderr_write;
-
-    std::vector<char> cmd(command.begin(), command.end());
-    cmd.push_back('\0');
-
-    if (!CreateProcessA(NULL, cmd.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
-        throw std::runtime_error("Failed to create process");
-    }
-
-    CloseHandle(stdout_write);
-    CloseHandle(stderr_write);
-
-    std::array<char, 128> buffer;
-    DWORD bytes_read;
-
-    while (ReadFile(stdout_read, buffer.data(), (DWORD)buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
-        stdout_str.append(buffer.data(), bytes_read);
-    }
-
-    while (ReadFile(stderr_read, buffer.data(), (DWORD)buffer.size(), &bytes_read, NULL) && bytes_read > 0) {
-        stderr_str.append(buffer.data(), bytes_read);
-    }
-
-    CloseHandle(stdout_read);
-    CloseHandle(stderr_read);
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-#else
-    int stdout_pipe[2];
-    int stderr_pipe[2];
-
-    if (pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0) {
-        throw std::runtime_error("Failed to create pipes");
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        throw std::runtime_error("Failed to fork process");
-    }
-
-    if (pid == 0) {
-        close(stdout_pipe[0]);
-        close(stderr_pipe[0]);
-        dup2(stdout_pipe[1], STDOUT_FILENO);
-        dup2(stderr_pipe[1], STDERR_FILENO);
-        close(stdout_pipe[1]);
-        close(stderr_pipe[1]);
-        execl("/bin/sh", "sh", "-c", command.c_str(), (char*) nullptr);
-        _exit(EXIT_FAILURE);
-    } else {
-        close(stdout_pipe[1]);
-        close(stderr_pipe[1]);
-
-        std::array<char, 128> buffer;
-        ssize_t bytes_read;
-
-        while ((bytes_read = read(stdout_pipe[0], buffer.data(), buffer.size())) > 0) {
-            stdout_str.append(buffer.data(), bytes_read);
-        }
-
-        while ((bytes_read = read(stderr_pipe[0], buffer.data(), buffer.size())) > 0) {
-            stderr_str.append(buffer.data(), bytes_read);
-        }
-
-        close(stdout_pipe[0]);
-        close(stderr_pipe[0]);
-        waitpid(pid, nullptr, 0);
-    }
-#endif
-}
-
-bool directory_exists(const std::string& path) {
-    struct stat info;
-    if (stat(path.c_str(), &info) != 0) {
-        return false; // Path doesn't exist or can't be accessed
-    }
-    return (info.st_mode & S_IFDIR) != 0; // Check if it is a directory
-}
-
-bool create_directory(const std::string& path) {
-#ifdef _WIN32
-    return _mkdir(path.c_str()) == 0 || errno == EEXIST; // EEXIST means the directory already exists
-#else
-    return mkdir(path.c_str(), 0755) == 0 || errno == EEXIST; // 0755 is the directory permissions
-#endif
-}
 
 std::string to_uppercase(const std::string& input) {
     std::string result = input;
@@ -225,32 +122,58 @@ bool is_iq_quant(const std::string& type_name) {
     return string_starts_with(type_name, "iq");
 }
 
-static const char path_separator = '/';
-
-std::string join_paths(const std::string& path1, const std::string& path2) {
-    return path1 + path_separator + path2;
-}
-
-std::string basename(const std::string &path) {
-    return path.substr(path.find_last_of("/\\") + 1);
-}
-
 std::stringstream make_generic_stringstream() {
     std::stringstream ss;
     ss.imbue(c_locale);
     return ss;
 }
 
-struct compile_command {
-    std::string name;
-    std::string input_filepath;
-    std::string output_filepath;
-    std::vector<std::string> flags;
-};
+std::vector<unsigned char> read_binary_file(const path& path, bool may_not_exist = false) {
+    std::fstream f(path, std::ios::in | std::ios::binary);
+    if (!f) {
+        if (!may_not_exist) {
+            std::cerr << "Error opening file: " << path << " (" << strerror(errno) << ")\n";
+        }
+        return {};
+    }
 
-// Code for writing a CMake build file
+    f.seekg(0, std::ios::end);
+    size_t size = f.tellg();
+    f.seekg(0, std::ios::beg);
 
-std::stringstream cmake_lists;
+    std::vector<unsigned char> data(size);
+    f.read(reinterpret_cast<char*>(data.data()), size);
+    if (!f) {
+        std::cerr << "Error reading file: " << path << " (" << strerror(errno) << ")\n";
+        return {};
+    }
+    return data;
+}
+
+void write_binary_file(const path& path, const unsigned char * data, size_t size) {
+    std::fstream f(path, std::ios::out | std::ios::binary);
+    if (!f) {
+        std::cerr << "Error opening file for writing: " << path << " (" << strerror(errno) << ")\n";
+        return;
+    }
+
+    f.write(reinterpret_cast<const char*>(data), size);
+    if (!f) {
+        std::cerr << "Error writing file: " << path << " (" << strerror(errno) << ")\n";
+        return;
+    }
+}
+
+void write_binary_file(const path& path, const std::string& content) {
+    write_binary_file(path, (const unsigned char *)content.data(), content.size());
+}
+
+void write_file_if_changed(const path& path, const std::string& content) {
+    std::vector<unsigned char> existing = read_binary_file(path, true);
+    if (existing.size() != content.size() || memcmp(existing.data(), content.data(), content.size()) != 0) {
+        write_binary_file(path, content);
+    }
+}
 
 struct cmake_escape { const std::string& str; };
 std::ostream& operator<<(std::ostream& os, const cmake_escape& to_escape) {
@@ -263,48 +186,84 @@ std::ostream& operator<<(std::ostream& os, const cmake_escape& to_escape) {
     return os;
 }
 
-void cmake_add_header() {
-    cmake_lists = make_generic_stringstream();
-    cmake_lists << "cmake_minimum_required(VERSION 3.14)\n";
-    cmake_lists << "project(ggml-vulkan-shaders)\n\n";
-    cmake_lists << "set(GLSLC \"" << GLSLC << "\")\n\n";
-    cmake_lists << "function(compile_shader name in_file out_file flags)\n";
-    cmake_lists << "  add_custom_command(\n";
-    cmake_lists << "    OUTPUT ${out_file}\n";
-    cmake_lists << "    COMMAND ${GLSLC} ${flags} ${ARGN} -MD -MF ${out_file}.d ${in_file} -o ${out_file}\n";
-    cmake_lists << "    DEPENDS ${in_file}\n";
-    cmake_lists << "    DEPFILE ${out_file}.d\n";
-    cmake_lists << "    COMMENT \"Building Vulkan shader ${name}.spv\"\n";
-    cmake_lists << "  )\n";
-    cmake_lists << "endfunction()\n\n";
-}
+struct cmake_lists {
+    std::stringstream out = make_generic_stringstream();
+    std::vector<path> out_filepaths;
 
-void cmake_add_build_command(const compile_command& cmd) {
-    cmake_lists << "compile_shader(" << cmd.name << " \"" << cmd.input_filepath  << "\" \"" << cmd.output_filepath << "\" ";
-    for (const std::string& flag : cmd.flags) {
-        cmake_lists << "\"" << cmake_escape{flag} << "\" ";
+    void add_header(int argc, char ** argv) {
+        out << "# Generated with ";
+        for (int i = 0; i < argc; i++) {
+            out << argv[i] << " ";
+        }
+        out << "\n\n";
+        out << "cmake_minimum_required(VERSION 3.14)\n";
+        out << "project(ggml-vulkan-shaders)\n\n";
+        out << "set(GLSLC \"" << GLSLC << "\")\n\n";
+        out << "function(compile_shader name in_file out_file flags)\n";
+        out << "  add_custom_command(\n";
+        out << "    OUTPUT ${out_file}\n";
+        out << "    COMMAND ${GLSLC} ${flags} ${ARGN} -MD -MF ${out_file}.d ${in_file} -o ${out_file}\n";
+        out << "    DEPENDS ${in_file}\n";
+        out << "    DEPFILE ${out_file}.d\n";
+        out << "    COMMENT \"Building Vulkan shader ${name}.spv\"\n";
+        out << "  )\n";
+        out << "endfunction()\n\n";
     }
-    cmake_lists << ")\n";
-    shader_fnames.push_back(std::make_pair(cmd.name, cmd.output_filepath));
-}
 
-void cmake_add_target() {
-    cmake_lists << "\nadd_custom_target(ggml-vulkan-shaders ALL DEPENDS\n";
-    for (const auto& pair : shader_fnames) {
-        cmake_lists << "  \"" << pair.second << "\"\n";
+    void add_build_command(std::string_view name, const path & in_filepath, const path & out_filepath, const std::vector<std::string> & flags) {
+        out << "compile_shader(" << name << " " << in_filepath << " " << out_filepath << " ";
+        for (const std::string & flag : flags) {
+            out << "\"" << cmake_escape{ flag } << "\" ";
+        }
+        out << ")\n";
+        out_filepaths.emplace_back(out_filepath);
     }
-    cmake_lists << ")\n";
+
+    void add_target_embed(const path & shaders_gen_executable, const path & target_hpp, const path & target_cpp) {
+        out << "\nadd_custom_command(\n";
+        out << "  OUTPUT " << target_hpp << " " << target_cpp << "\n";
+        out << "  COMMAND " << shaders_gen_executable 
+            << " --glslc " << GLSLC
+            << " --input-dir " << input_dir
+            << " --output-dir " << output_dir
+            << " --target-hpp " << target_hpp
+            << " --target-cpp " << target_cpp << "\n";
+        out << "  DEPENDS\n";
+        for (const path & spv_path : out_filepaths) {
+            out << "    " << spv_path << "\n";
+        }
+        out << "  COMMENT \"Embedding Vulkan shaders into C++ source\"\n";
+        out << ")\n";
+
+        out << "\nadd_custom_target(vulkan-shaders ALL DEPENDS\n";
+        out << "  " << target_hpp << "\n";
+        out << "  " << target_cpp << "\n";
+        out << ")\n";
+    }
+
+    void add_target_build_only() {
+        out << "\nadd_custom_target(vulkan-shaders ALL DEPENDS\n";
+        for (const auto & spv_path : out_filepaths) {
+            out << "  " << spv_path << "\n";
+        }
+        out << ")\n";
+    }
+
+    void write(const path & target_filepath) { write_file_if_changed(target_filepath, out.str()); }
+};
+
+cmake_lists cmake;
+
+std::map<std::string, std::string> merge_maps(const std::map<std::string, std::string>& a, const std::map<std::string, std::string>& b) {
+    std::map<std::string, std::string> result = a;
+    result.insert(b.begin(), b.end());
+    return result;
 }
 
-// variables to track number of compiles in progress
-static uint32_t compile_count = 0;
-static std::mutex compile_count_mutex;
-static std::condition_variable compile_count_cond;
-
-compile_command create_compile_command(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16, bool coopmat, bool coopmat2, bool f16acc) {
+void string_to_spv(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false) {
     std::string name = _name + (f16acc ? "_f16acc" : "") + (coopmat ? "_cm1" : "") + (coopmat2 ? "_cm2" : (fp16 ? "" : "_fp32"));
-    std::string out_path = join_paths(output_dir, name + ".spv");
-    std::string in_path = join_paths(input_dir, in_fname);
+    path out_path = output_dir / (name + ".spv");
+    path in_path = input_dir / in_fname;
 
     std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
 
@@ -322,73 +281,8 @@ compile_command create_compile_command(const std::string& _name, const std::stri
         flags.push_back("-D" + define.first + "=" + define.second);
     }
 
-    return {std::move(name), std::move(in_path), std::move(out_path), std::move(flags)};
-}
-
-void execute_compile_command(compile_command cmd) {
-    std::string stdout_str, stderr_str;
-    try {
-        // std::cout << "Executing command: ";
-        // for (const auto& part : cmd) {
-        //     std::cout << part << " ";
-        // }
-        // std::cout << std::endl;
-
-        std::string flags_str;
-        for (const auto& part : cmd.flags) {
-            flags_str += part + " ";
-        }
-
-        #ifdef _WIN32
-            std::string command = GLSLC + " " + flags_str + " \"" + cmd.input_filepath + "\" -o \"" + cmd.output_filepath + "\"";
-        #else
-            std::string command = GLSLC + " " + flags_str + " " + cmd.input_filepath + " -o " + cmd.output_filepath;
-        #endif
-        execute_command(command, stdout_str, stderr_str);
-
-        if (!stderr_str.empty()) {
-            std::cerr << "cannot compile " << cmd.name << "\n\n" << command << "\n\n" << stderr_str << std::endl;
-            return;
-        }
-
-        std::lock_guard<std::mutex> guard(lock);
-        shader_fnames.push_back(std::make_pair(cmd.name, cmd.output_filepath));
-    } catch (const std::exception& e) {
-        std::cerr << "Error executing command for " << cmd.name << ": " << e.what() << std::endl;
-    }
-    {
-        std::lock_guard<std::mutex> guard(compile_count_mutex);
-        assert(compile_count > 0);
-        compile_count--;
-    }
-    compile_count_cond.notify_all();
-}
-
-std::map<std::string, std::string> merge_maps(const std::map<std::string, std::string>& a, const std::map<std::string, std::string>& b) {
-    std::map<std::string, std::string> result = a;
-    result.insert(b.begin(), b.end());
-    return result;
-}
-
-static std::vector<std::future<void>> compiles;
-void string_to_spv(const std::string& _name, const std::string& in_fname, const std::map<std::string, std::string>& defines, bool fp16 = true, bool coopmat = false, bool coopmat2 = false, bool f16acc = false) {
-    compile_command cmd = create_compile_command(_name, in_fname, defines, fp16, coopmat, coopmat2, f16acc);
-
-    if (!target_cmake.empty()) {
-        cmake_add_build_command(cmd);
-        return;
-    }
-    {
-        // wait until fewer than N compiles are in progress.
-        // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
-        uint32_t N = 16;
-        std::unique_lock<std::mutex> guard(compile_count_mutex);
-        while (compile_count >= N) {
-            compile_count_cond.wait(guard);
-        }
-        compile_count++;
-    }
-    compiles.push_back(std::async(execute_compile_command, std::move(cmd)));
+    cmake.add_build_command(name, in_path, out_path, flags);
+    shader_fnames.emplace_back(name, out_path);
 }
 
 void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool coopmat2, bool f16acc) {
@@ -832,87 +726,25 @@ void process_shaders() {
 
     string_to_spv("multi_add_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}, {"ADD_RMS" , "0"}});
     string_to_spv("multi_add_rms_f32", "multi_add.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}, {"ADD_RMS" , "1"}});
-
-    for (auto &c : compiles) {
-        c.wait();
-    }
 }
 
-std::vector<unsigned char> read_binary_file(const std::string& path, bool may_not_exist = false) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) {
-        if (!may_not_exist) {
-            std::cerr << "Error opening file: " << path << " (" << strerror(errno) << ")\n";
-        }
-        return {};
-    }
 
-    fseek(f, 0, SEEK_END);
-    size_t size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    std::vector<unsigned char> data(size);
-    size_t read_size = fread(data.data(), 1, size, f);
-    fclose(f);
-    if (read_size != size) {
-        std::cerr << "Error reading file: " << path << " (" << strerror(errno) << ")\n";
-        return {};
-    }
-
-    return data;
-}
-
-void write_binary_file(const std::string& path, const unsigned char * data, size_t size) {
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) {
-        std::cerr << "Error opening file for writing: " << path << " (" << strerror(errno) << ")\n";
-        return;
-    }
-
-    size_t write_size = fwrite(data, 1, size, f);
-    fclose(f);
-    if (write_size != size) {
-        std::cerr << "Error writing file: " << path << " (" << strerror(errno) << ")\n";
-        return;
-    }
-}
-
-void write_binary_file(const std::string& path, const std::string& content) {
-    write_binary_file(path, (const unsigned char *)content.data(), content.size());
-}
-
-void write_file_if_changed(const std::string& path, const std::string& content) {
-    std::vector<unsigned char> existing = read_binary_file(path, true);
-    if (existing.size() != content.size() || memcmp(existing.data(), content.data(), content.size()) != 0) {
-        write_binary_file(path, content);
-    }
-}
-
-void write_output_files() {
+void write_embed_files(const path& target_hpp, const path& target_cpp, bool no_embed) {
     std::stringstream hdr = make_generic_stringstream();
     std::stringstream src = make_generic_stringstream();
 
     hdr << "#include <cstdint>\n\n";
-    src << "#include \"" << basename(target_hpp).c_str() << "\"\n\n";
+    src << "#include \"" << target_hpp.filename().string() << "\"\n\n";
 
     if (no_embed) {
-        std::string shader_dir = output_dir;
-        std::replace(shader_dir.begin(), shader_dir.end(), '\\', '/' );
-        hdr << "#define GGML_VK_SHADER_DIR \"" << shader_dir << "\"\n\n";
+        hdr << "#define GGML_VK_SHADER_DIR \"" << output_dir.generic_string() << "\"\n\n";
     }
 
     std::sort(shader_fnames.begin(), shader_fnames.end());
     for (const auto& pair : shader_fnames) {
-        const std::string& name = pair.first;
-        #ifdef _WIN32
-            std::string path = pair.second;
-            std::replace(path.begin(), path.end(), '/', '\\' );
-        #else
-            const std::string& path = pair.second;
-        #endif
-
+        auto && [name, path] = pair;
         if (no_embed) {
-            hdr << "inline constexpr char const * " << name << "_data = \"" << basename(path) << "\";\n";
+            hdr << "inline constexpr char const * " << name << "_data = \"" << path.filename().string() << "\";\n";
             hdr << "const uint64_t " << name << "_len = 0;\n\n";
         } else {
             std::vector<unsigned char> data = read_binary_file(path);
@@ -929,10 +761,6 @@ void write_output_files() {
                 if ((i + 1) % 12 == 0) src << "\n";
             }
             src << std::dec << "\n};\n\n";
-
-            if (!no_clean) {
-                std::remove(path.c_str());
-            }
         }
     }
 
@@ -1017,10 +845,6 @@ void write_output_files() {
     } else {
         write_binary_file(target_cpp, src.str());
     }
-    if (!target_cmake.empty()) {
-        cmake_add_target();
-        write_file_if_changed(target_cmake, cmake_lists.str());
-    }
 }
 
 } // namespace
@@ -1039,6 +863,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    path target_hpp = "ggml-vulkan-shaders.hpp";
+    path target_cpp = "ggml-vulkan-shaders.cpp";
+    path target_cmake;
+    bool no_embed = false;
+
     if (args.find("--glslc") != args.end()) {
         GLSLC = args["--glslc"]; // Path to glslc
     }
@@ -1054,32 +883,57 @@ int main(int argc, char** argv) {
     if (args.find("--target-cpp") != args.end()) {
         target_cpp = args["--target-cpp"]; // Path to generated cpp file
     }
-    if (args.find("--no-clean") != args.end()) {
-        no_clean = true; // Keep temporary SPIR-V files in output-dir after build
+    if (args.find("--target-cmake") != args.end()) {
+        target_cmake = args["--target-cmake"]; // Path to the generated CMakeLists.txt file
     }
     if (args.find("--no-embed") != args.end()) {
         no_embed = true; // Do not embed SPIR-V binaries into C++ source files, only write stubs to header
     }
-    if (args.find("--cmake") != args.end()) {
-        target_cmake = args["--cmake"]; // Write a CMakeLists.txt file instead of invoking glslc directly
-        cmake_add_header();
+    if (args.find("--help") != args.end()) {
+        std::cout << usage << std::endl;
+        return EXIT_SUCCESS;
     }
 
-    if (!directory_exists(input_dir)) {
-        std::cerr << "\"" << input_dir << "\" must be a valid directory containing shader sources" << std::endl;
+    if (no_embed && target_cmake.empty()) {
+        std::cerr << "--no-embed requires --target-cmake to be specified\n";
         return EXIT_FAILURE;
     }
 
-    if (!directory_exists(output_dir)) {
-        if (!create_directory(output_dir)) {
-            std::cerr << "Error creating output directory: " << output_dir << "\n";
+    try {
+        if (!exists(input_dir)) {
+            std::cerr << "Input directory does not exist: " << input_dir << "\n";
             return EXIT_FAILURE;
         }
+        if (!exists(output_dir)) {
+            create_directories(output_dir);
+        }
+
+        if (!target_cmake.empty()) {
+            if (target_cmake.has_parent_path() && !exists(target_cmake.parent_path())) {
+                create_directories(target_cmake.parent_path());
+            }
+            cmake.add_header(argc, argv);
+        }
+
+        process_shaders();
+
+        if (target_cmake.empty() || no_embed) {
+            write_embed_files(target_hpp, target_cpp, no_embed);
+        }
+
+        if (!target_cmake.empty()) {
+            if (no_embed) {
+                cmake.add_target_build_only();
+            } else {
+                cmake.add_target_embed(path(argv[0]), target_hpp, target_cpp);
+            }
+            cmake.write(target_cmake);
+        }
+
+    } catch (const std::exception& ex) {
+        std::cerr << "Error: " << ex.what() << "\n";
+        return EXIT_FAILURE;
     }
-
-    process_shaders();
-
-    write_output_files();
 
     return EXIT_SUCCESS;
 }

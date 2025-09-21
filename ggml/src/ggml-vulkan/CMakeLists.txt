@@ -159,11 +159,11 @@ if (Vulkan_FOUND)
     set (_ggml_vk_host_suffix $<IF:$<STREQUAL:${CMAKE_HOST_SYSTEM_NAME},Windows>,.exe,>)
     set (_ggml_vk_genshaders_dir "${CMAKE_BINARY_DIR}/$<CONFIG>")
     set (_ggml_vk_genshaders_cmd "${_ggml_vk_genshaders_dir}/vulkan-shaders-gen${_ggml_vk_host_suffix}")
-    set (_ggml_vk_header     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
-    set (_ggml_vk_source     "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.cpp")
-    set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
-    set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
-    set (_ggml_vk_shaders_gen_output ${_ggml_vk_header} ${_ggml_vk_source})
+    set (_ggml_vk_header       "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.hpp")
+    set (_ggml_vk_source       "${CMAKE_CURRENT_BINARY_DIR}/ggml-vulkan-shaders.cpp")
+    set (_ggml_vk_input_dir    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
+    set (_ggml_vk_output_dir   "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
+    set (_ggml_vk_shader_cmake "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders/CMakeLists.txt")
 
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
 
@@ -176,22 +176,21 @@ if (Vulkan_FOUND)
                                 "${_ggml_vk_input_dir}/*.h")
 
     if(GGML_VULKAN_SHADER_DEV)
-        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders")
-        set(_ggml_vk_shader_cmake_file "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders/CMakeLists.txt")
-        set(_ggml_vk_shader_dev_args --no-embed --cmake ${_ggml_vk_shader_cmake_file})
-        set(_ggml_vk_shaders_gen_output ${_ggml_vk_shader_cmake_file})
+        # Don't embed SPIRV in C++ source, only generate ggml-vulkan-shaders.hpp/cpp stubs.
+        # Shaders will be read from disk at runtime, so changes to shaders don't require C++ compilation.
+        set(_ggml_vk_shader_dev_args --no-embed)
     endif()
 
     add_custom_command(
-        OUTPUT ${_ggml_vk_shaders_gen_output}
+        OUTPUT ${_ggml_vk_shader_cmake}
 
         COMMAND ${_ggml_vk_genshaders_cmd}
-            --glslc      ${Vulkan_GLSLC_EXECUTABLE}
-            --input-dir  ${_ggml_vk_input_dir}
-            --output-dir ${_ggml_vk_output_dir}
-            --target-hpp ${_ggml_vk_header}
-            --target-cpp ${_ggml_vk_source}
-            --no-clean
+            --glslc        ${Vulkan_GLSLC_EXECUTABLE}
+            --input-dir    ${_ggml_vk_input_dir}
+            --output-dir   ${_ggml_vk_output_dir}
+            --target-hpp   ${_ggml_vk_header}
+            --target-cpp   ${_ggml_vk_source}
+            --target-cmake ${_ggml_vk_shader_cmake}
             ${_ggml_vk_shader_dev_args}
 
         DEPENDS ${_ggml_vk_shader_files}
@@ -200,24 +199,20 @@ if (Vulkan_FOUND)
 
         COMMENT "Generate vulkan shaders"
     )
-
-    if(GGML_VULKAN_SHADER_DEV)
-        add_custom_command(
-            OUTPUT ${_ggml_vk_output_dir}/CMakeCache.txt
-            COMMAND cmake -S ${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders -B ${_ggml_vk_output_dir} -G ${CMAKE_GENERATOR}
-            DEPENDS ${_ggml_vk_shader_cmake_file}
-            COMMENT "Configure vulkan shaders"
-        )
-        add_custom_command(
-            OUTPUT ${_ggml_vk_header}
-                   ${_ggml_vk_source}
-            DEPENDS ${_ggml_vk_output_dir}/CMakeCache.txt
-                    ${_ggml_vk_shader_cmake_file}
-                    ${_ggml_vk_shader_files}
-            COMMAND cmake --build ${_ggml_vk_output_dir} --target all
-            COMMENT "Build vulkan shaders"
-        )
-    endif()
+    add_custom_command(
+        OUTPUT ${_ggml_vk_output_dir}/CMakeCache.txt
+        COMMAND cmake -S ${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders -B ${_ggml_vk_output_dir} -G ${CMAKE_GENERATOR}
+        DEPENDS ${_ggml_vk_shader_cmake}
+        COMMENT "Configure vulkan shaders"
+    )
+    add_custom_command(
+        OUTPUT ${_ggml_vk_header} ${_ggml_vk_source}
+        COMMAND cmake --build ${_ggml_vk_output_dir} --target all
+        DEPENDS ${_ggml_vk_output_dir}/CMakeCache.txt
+                ${_ggml_vk_shader_cmake}
+                ${_ggml_vk_shader_files}
+        COMMENT "Build vulkan shaders"
+    )
 
     target_sources(ggml-vulkan PRIVATE ${_ggml_vk_source} ${_ggml_vk_header})
 
