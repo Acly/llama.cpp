@@ -97,14 +97,12 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 
 #define GGML_VK_MAX_NODES 8192
 
-#define VK_CHECK(err, msg)                                          \
-    do {                                                            \
-        vk::Result err_ = (err);                                    \
-        if (err_ != vk::Result::eSuccess) {                         \
-            fprintf(stderr, "ggml_vulkan: %s error %s at %s:%d\n",  \
-                #err, to_string(err_).c_str(), __FILE__, __LINE__); \
-            exit(1);                                                \
-        }                                                           \
+#define VK_CHECK(err, msg)                                                                         \
+    do {                                                                                           \
+        vk::Result err_ = (err);                                                                   \
+        if (err_ != vk::Result::eSuccess) {                                                        \
+            ggml_abort(__FILE__, __LINE__, "%s: %s", #err, to_string(err_).c_str());               \
+        }                                                                                          \
     } while (0)
 
 #ifdef GGML_VULKAN_DEBUG
@@ -701,7 +699,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_clamp_f32;
     vk_pipeline pipeline_pad_f32;
     vk_pipeline pipeline_roll_f32;
-    vk_pipeline pipeline_repeat_f32, pipeline_repeat_back_f32;
+    vk_pipeline pipeline_repeat_f32, pipeline_repeat_f16, pipeline_repeat_back_f32;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
     vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
     vk_pipeline pipeline_cpy_f32_quant[GGML_TYPE_COUNT];
@@ -783,6 +781,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_count_equal_i32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
+    vk_pipeline pipeline_im2col_cwhn_f32;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
     vk_pipeline pipeline_timestep_embedding_f32;
     vk_pipeline pipeline_conv_transpose_1d_f32;
@@ -796,6 +795,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
+    std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_deform_f32[CONV_SHAPE_COUNT];
+    std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_deform_f16_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f16_f32[CONV_SHAPE_COUNT];
     vk_pipeline pipeline_conv2d_dw_whcn_f32, pipeline_conv2d_dw_whcn_f16_f32;
@@ -1444,6 +1445,8 @@ struct vk_op_conv2d_push_constants {
     uint32_t OWmp;   uint32_t OWL;
     uint32_t OWOHmp; uint32_t OWOHL;
 };
+
+using vk_op_conv2d_deform_push_constants = vk_op_conv2d_push_constants;
 
 template <> void init_pushconst_fastdiv(vk_op_conv2d_push_constants &p) {
     // Compute magic values to divide by OW, OW*OH
@@ -4152,6 +4155,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_roll_f32, "roll_f32", roll_f32_len, roll_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_repeat_f32, "repeat_f32", repeat_f32_len, repeat_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_repeat_f16, "repeat_f16", repeat_f16_len, repeat_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_repeat_back_f32, "repeat_back_f32", repeat_back_f32_len, repeat_back_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
 #define CREATE_UNARY(name)  \
@@ -4329,6 +4333,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     } else {
         IM2COL()
     }
+    ggml_vk_create_pipeline(device, device->pipeline_im2col_cwhn_f32, "im2col_cwhn_f32", im2col_cwhn_f32_len, im2col_cwhn_f32_data, "main", 2, sizeof(vk_op_im2col_push_constants), {512, 1, 1}, { device->subgroup_size }, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_timestep_embedding_f32, "timestep_embedding_f32", timestep_embedding_f32_len, timestep_embedding_f32_data, "main", 2, sizeof(vk_op_timestep_embedding_push_constants), {256, 1, 1}, {}, 1);
 
@@ -4407,7 +4412,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         std::array<uint32_t, 3> wg_denoms = { conv2d_BS.K, 1, 1 };
         std::vector<uint32_t> spec_constants = { conv2d_WG_SIZE, conv2d_BS.K, conv2d_BS.CRS, conv2d_BS.NPQ, conv2d_TS_K, use_collectives, conv2d_SHMEM_PAD };
 
-#define CREATE_CONV(name, type_suffix, spv_suffix) \
+#define CREATE_CONV(name, type_suffix, spv_suffix, n_sources) \
         for (auto &c : device->pipeline_##name##type_suffix[s]) { \
             const vk_conv2d_pipeline_state &state = c.first;  \
             std::vector<uint32_t> spec_constants_cpy = spec_constants; \
@@ -4421,14 +4426,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
             spec_constants_cpy.push_back(state.KH); \
             ggml_vk_create_pipeline( \
                 device, c.second, #name #type_suffix, \
-                name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", 3, \
+                name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", n_sources, \
                 sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants_cpy, 1, true, use_collectives);    \
         }
 #define CREATE_CONVS(spv_suffix) \
-        CREATE_CONV(conv2d, _f32, spv_suffix) \
-        CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix)
+        CREATE_CONV(conv2d, _f32, spv_suffix, 3) \
+        CREATE_CONV(conv2d, _f16_f32, spv_suffix, 3) \
+        CREATE_CONV(conv_transpose_2d, _f32, spv_suffix, 3) \
+        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix, 3) \
+        CREATE_CONV(conv2d_deform, _f32, spv_suffix, 5) \
+        CREATE_CONV(conv2d_deform, _f16_f32, spv_suffix, 5)
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
         if (device->coopmat2) {
             CREATE_CONVS(_cm2)
@@ -8808,6 +8815,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_REPEAT:
         if (ggml_type_size(src0->type) == sizeof(float) && ggml_type_size(dst->type) == sizeof(float)) {
             return ctx->device->pipeline_repeat_f32;
+        } else if (ggml_type_size(src0->type) == 2 && ggml_type_size(dst->type) == 2) {
+            return ctx->device->pipeline_repeat_f16;
         }
         return nullptr;
     case GGML_OP_REPEAT_BACK:
@@ -9058,11 +9067,17 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_IM2COL:
-        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_im2col_f32;
-        }
-        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
-            return ctx->device->pipeline_im2col_f32_f16;
+        if (ggml_is_contiguous(src1)) {
+            if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+                return ctx->device->pipeline_im2col_f32;
+            }
+            if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+                return ctx->device->pipeline_im2col_f32_f16;
+            }
+        } else if (ggml_is_contiguous_channels(src1)) {
+            if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+                return ctx->device->pipeline_im2col_cwhn_f32;
+            }
         }
         return nullptr;
     case GGML_OP_IM2COL_3D:
@@ -9129,6 +9144,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_CONV_2D:
+    case GGML_OP_CONV_2D_DEFORM:
     case GGML_OP_CONV_TRANSPOSE_2D:
         if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             uint32_t K = dst->ne[2]; // Cout
@@ -9152,6 +9168,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                     pipelines = &ctx->device->pipeline_conv2d_f32[shape];
                 } else if (src0->type == GGML_TYPE_F16) {
                     pipelines = &ctx->device->pipeline_conv2d_f16_f32[shape];
+                }
+            } else if (op == GGML_OP_CONV_2D_DEFORM) {
+                if (src0->type == GGML_TYPE_F32) {
+                    pipelines = &ctx->device->pipeline_conv2d_deform_f32[shape];
+                } else if (src0->type == GGML_TYPE_F16) {
+                    pipelines = &ctx->device->pipeline_conv2d_deform_f16_f32[shape];
                 }
             } else if (op == GGML_OP_CONV_TRANSPOSE_2D) {
                 if (src0->type == GGML_TYPE_F32) {
@@ -9431,7 +9453,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
             const uint32_t batch = src1->ne[is_2D ? 3 : 2];
 
-            elements = { OW * KW * KH, OH, batch * IC };
+            if (ggml_is_contiguous(src1)) {
+                elements = { OW * KW * KH, OH, batch * IC };
+            } else { // channels are contiguous in memory
+                elements = { IC * OW * KW * KH, OH * batch, 1 };
+            }
             elements[1] = std::min(elements[1], ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
             elements[2] = std::min(elements[2], ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
         } break;
@@ -9475,6 +9501,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         } break;
     case GGML_OP_CONV_2D:
     case GGML_OP_CONV_TRANSPOSE_2D:
+    case GGML_OP_CONV_2D_DEFORM:
         if constexpr (std::is_same_v<PC, vk_op_conv2d_push_constants>) {
             const uint32_t NPQ = pc.N * pc.OH * pc.OW;
             const vk_conv_shapes shape = ggml_vk_conv_select_shape(ctx, pc.Cout, NPQ);
@@ -11021,7 +11048,9 @@ static void ggml_vk_im2col(ggml_backend_vk_context * ctx, vk_context& subctx, co
     const uint32_t offset_delta = src1->nb[is_2D ? 2 : 1] / 4; // nb is byte offset, src is type float32
     const uint32_t batch_offset = src1->nb[is_2D ? 3 : 2] / 4; // nb is byte offset, src is type float32
 
-    const uint32_t pelements = OW * KW * KH;
+    const bool is_cwhn = !ggml_is_contiguous(src1);
+
+    const uint32_t pelements = OW * KW * KH * (is_cwhn ? IC : 1);
     const uint32_t batch = src1->ne[is_2D ? 3 : 2];
 
     const ggml_backend_vk_buffer_context * d_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
@@ -11211,7 +11240,7 @@ static void ggml_vk_conv_2d(ggml_backend_vk_context * ctx, vk_context & subctx, 
     p.nb2 = static_cast<uint32_t>(nb2 / nb0);
     p.nb3 = static_cast<uint32_t>(nb3 / nb0);
 
-    ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, dst->op, std::move(p));
+    ggml_vk_op_f32(ctx, subctx, src0, src1, dst->src[2], dst->src[3], dst, dst->op, std::move(p));
 }
 
 static void ggml_vk_conv_2d_dw(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -12598,6 +12627,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_CONV_2D:
     case GGML_OP_CONV_TRANSPOSE_2D:
+    case GGML_OP_CONV_2D_DEFORM:
         ggml_vk_conv_2d(ctx, compute_ctx, src0, src1, node);
 
         break;
@@ -14403,6 +14433,12 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     };
 }
 
+static bool ggml_backend_dev_vk_supports_f16(ggml_backend_dev_t dev) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    auto device = ggml_vk_get_device(ctx->device);
+    return device->fp16;
+}
+
 static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {
     UNUSED(params);
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
@@ -14898,6 +14934,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_2D:
+        case GGML_OP_CONV_2D_DEFORM:
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 // Channel-contiguous format is not supported yet.
@@ -15081,11 +15118,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    UNUSED(reg);
+    if (std::string_view(name) == "ggml_backend_dev_supports_f16") {
+        return (void *)ggml_backend_dev_vk_supports_f16;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

@@ -801,6 +801,7 @@ void process_shaders() {
     string_to_spv("div_f32", "div.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("repeat_f32", "repeat.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("repeat_f16", "repeat.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
     string_to_spv("repeat_back_f32", "repeat_back.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
     string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
@@ -959,6 +960,8 @@ void process_shaders() {
         }
     }
 
+    string_to_spv("im2col_cwhn_f32", "im2col.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"CWHN", "1"}}));
+
     string_to_spv("timestep_embedding_f32", "timestep_embedding.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
     string_to_spv("conv_transpose_1d_f32", "conv_transpose_1d.comp", {{"A_TYPE", "float"},  {"B_TYPE", "float"}, {"D_TYPE", "float"}});
@@ -974,16 +977,20 @@ void process_shaders() {
 
     string_to_spv("solve_tri_f32", "solve_tri.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 
-    for (auto transpose : {false, true}) {
+    for (auto variant : {"conv2d", "conv2d_deform", "conv_transpose_2d"}) {
         for (auto unroll : {false, true}) {
             for (auto a_f16 : {false, true}) {
                 std::map<std::string, std::string> defines = {
                     {"A_TYPE", a_f16 ? "float16_t" : "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"},
                     {"USE_COLLECTIVES", "1"}, {"UNROLL", unroll ? "[[unroll]]" : ""},
                 };
-                if (transpose) defines["TRANSPOSE"] = "1";
-                std::string name = std::string(transpose ? "conv_transpose_2d": "conv2d")
-                    + (a_f16 ? "_f16" : "") + "_f32";
+                std::string name = variant;
+                if (name == "conv2d_deform") {
+                    defines["DEFORM"] = "1";
+                } else if (name == "conv_transpose_2d") {
+                    defines["TRANSPOSE"] = "1";
+                }
+                name += a_f16 ? "_f16_f32" : "_f32";
                 string_to_spv(name + (unroll ? "_unroll" : ""), "conv2d_mm.comp", defines);
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
                 if (unroll) {
