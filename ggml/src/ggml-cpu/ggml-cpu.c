@@ -1908,6 +1908,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_conv_2d_dw(params, tensor);
             } break;
+        case GGML_OP_CONV_2D_DEFORM:
+            {
+                ggml_compute_forward_conv_2d_deform(params, tensor);
+            } break;
         case GGML_OP_CONV_TRANSPOSE_2D:
             {
                 ggml_compute_forward_conv_transpose_2d(params, tensor);
@@ -2329,6 +2333,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONV_2D_DW:
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
+        case GGML_OP_CONV_2D_DEFORM:
             {
                 n_tasks = n_threads;
             } break;
@@ -2856,6 +2861,7 @@ struct ggml_cplan ggml_graph_plan(
                         }
                     } break;
                 case GGML_OP_CONV_2D:
+                case GGML_OP_CONV_2D_DEFORM:
                 case GGML_OP_CONV_3D:
                     {
                         cur = GGML_IM2COL_WORK_SIZE;
